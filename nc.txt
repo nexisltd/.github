@@ -1,0 +1,2 @@
+mysql-root=Scmuwmb8YyaRYc6r5u4sQD
+mysql-user=sWGNedmGS4D4ZsYJFKBegt
