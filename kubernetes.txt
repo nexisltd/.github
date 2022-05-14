@@ -1,5 +1,0 @@
-export K3S_
-
-curl -sfL https://get.k3s.io | sh -s - server --node-taint CriticalAddonsOnly=true:NoExecute --tls-san 10.27.27.103 \ DATASTORE_ENDPOINT='mysql://kubernetes:NexisLTDk3scluster!@tcp(10.27.27.91:5231)/k3s'
-
-curl -sfL https://get.k3s.io | sh -s - server --node-taint CriticalAddonsOnly=true:NoExecute --tls-san 10.27.27.103 --datastore-endpoint="mysql://kubernetes:NexisLTDk3scluster.@tcp(10.27.27.91:5231)/k3s"
