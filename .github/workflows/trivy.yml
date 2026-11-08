@@ -1,0 +1,136 @@
+# Reusable Trivy scan (nexisltd/security-stack spec.md, "Trivy in CI").
+# Fails the job on fixable CRITICAL vulnerabilities (and on critical secrets/misconfig with scanners set),
+# uploads SARIF to code scanning when the repo can take it (public, or GHAS), and always uploads
+# the SARIF + a CycloneDX SBOM as the artifact "sbom" (Dependency-Track pulls it from there).
+#
+# Use from any repo in any of our orgs:
+#   jobs:
+#     trivy:
+#       uses: nexisltd/.github/.github/workflows/trivy.yml@main
+#       permissions: { contents: read, security-events: write, actions: read }
+#       with:
+#         image: ghcr.io/nexisltd/foo:${{ github.sha }}   # optional: also scan a built image
+#
+# Trivy runs from its official image pinned by digest, not trivy-action (its tags were hijacked in
+# March 2026). Renovate keeps the digest current.
+name: trivy
+
+on:
+  workflow_call:
+    inputs:
+      scan-ref:
+        description: "Path to scan in the checkout (lockfiles, IaC, secrets)."
+        type: string
+        default: .
+      image:
+        description: "Optional image reference to scan as well (must be pullable by this job)."
+        type: string
+        default: ""
+      fail-severity:
+        description: Severities that fail the job.
+        type: string
+        default: CRITICAL
+      ignore-unfixed:
+        description: Do not fail on vulnerabilities that have no fixed version yet.
+        type: boolean
+        default: true
+      scanners:
+        description: Trivy scanners for the filesystem scan.
+        type: string
+        default: vuln,secret
+      upload-sarif:
+        description: "Try to upload SARIF to code scanning (skipped quietly where code scanning is unavailable)."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Trivy DB cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/trivy-cache
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      - name: Prepare
+        run: mkdir -p "$RUNNER_TEMP/trivy-cache" "$RUNNER_TEMP/trivy-out"
+
+      - name: Filesystem scan (report)
+        env:
+          SCAN_REF: ${{ inputs.scan-ref }}
+          SCANNERS: ${{ inputs.scanners }}
+        run: |
+          trivy() {
+            docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/trivy-cache:/cache" \
+              -v "$RUNNER_TEMP/trivy-out:/out" -w /src "$TRIVY_IMAGE" --cache-dir /cache "$@"
+          }
+          trivy fs --quiet --scanners "$SCANNERS" --format sarif --output /out/trivy-fs.sarif "$SCAN_REF"
+          trivy fs --quiet --format cyclonedx --output /out/sbom-fs.cdx.json "$SCAN_REF"
+          trivy fs --quiet --scanners vuln --severity HIGH,CRITICAL --format table "$SCAN_REF" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Image scan (report)
+        if: inputs.image != ''
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          docker pull -q "$IMAGE"
+          trivy() {
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock:ro -v "$RUNNER_TEMP/trivy-cache:/cache" \
+              -v "$RUNNER_TEMP/trivy-out:/out" "$TRIVY_IMAGE" --cache-dir /cache "$@"
+          }
+          trivy image --quiet --format sarif --output /out/trivy-image.sarif "$IMAGE"
+          trivy image --quiet --format cyclonedx --output /out/sbom-image.cdx.json "$IMAGE"
+          trivy image --quiet --severity HIGH,CRITICAL --format table "$IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SBOM + SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: ${{ runner.temp }}/trivy-out/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload SARIF to code scanning
+        if: always() && inputs.upload-sarif
+        continue-on-error: true # private repos without code scanning reject it; the artifact above still has it
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-out/
+          category: trivy
+
+      - name: Gate on ${{ inputs.fail-severity }}
+        env:
+          SCAN_REF: ${{ inputs.scan-ref }}
+          IMAGE: ${{ inputs.image }}
+          SEVERITY: ${{ inputs.fail-severity }}
+          IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
+          SCANNERS: ${{ inputs.scanners }}
+        run: |
+          flags=(--quiet --exit-code 1 --severity "$SEVERITY")
+          [[ "$IGNORE_UNFIXED" == true ]] && flags+=(--ignore-unfixed)
+          rc=0
+          docker run --rm -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/trivy-cache:/cache" -w /src \
+            "$TRIVY_IMAGE" --cache-dir /cache fs "${flags[@]}" --scanners "$SCANNERS" "$SCAN_REF" || rc=1
+          if [[ -n "$IMAGE" ]]; then
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock:ro -v "$RUNNER_TEMP/trivy-cache:/cache" \
+              "$TRIVY_IMAGE" --cache-dir /cache image "${flags[@]}" "$IMAGE" || rc=1
+          fi
+          if (( rc )); then echo "::error::Trivy found $SEVERITY findings (see the table in the job summary)"; fi
+          exit $rc
